@@ -26,13 +26,35 @@
      Android 重设 cpuset 时会把线程放回原来的核，所以这一档每 100ms 检查并重新绑定一次。
    - 某一档的温度余量回落到阈值以下 0.10、并持续 30 秒，才降回下一档。`BB_THERMAL_GOV=0` 关闭调速器。
 
-## 怎么用（不重装 App，游戏和已编好的原生代码都不受影响）
+## 用法一：共存 APK（和官方版装在一起）
+
+`tools/android/dev/build_coexist_apk.sh` 以官方 release APK 为底包，只改以下几处：
+- 包名改为 `io.github.zhouwuqi.bloodborne`，名称改为 **Bloodborne PS**，`taskAffinity` 和 provider authority 跟着改
+- 运行时里的 `libbbgpu.so` 换成这个分支编出来的版本，同时更新 `runtime.sha256`
+- 应用内更新检查和"Report a problem"指向这个 fork；GPU 驱动、地图包、Rebuild Tool 仍然从上游下载
+
+APK 里除了 `AndroidManifest.xml`、`resources.arsc`、`classes3.dex` 和运行时包之外，其余文件和官方 APK 逐字节相同。
+签名密钥在 `.local-deps/keys/`，以后的版本必须用同一把密钥，才能覆盖安装。
+
+```bash
+tools/android/dev/build_libbbgpu.sh && tools/android/dev/build_coexist_apk.sh   # 产物在 out/release/Bloodborne-PocketS-*.apk
+adb install out/release/Bloodborne-PocketS-*.apk
+tools/android/dev/pocket_s.sh migrate    # 把官方版里的原生代码、存档、设置和游戏文件夹路径复制过来（游戏本体两边共用）
+tools/android/dev/pocket_s.sh settings   # 设置 fps_limit=30、vsync=1、关闭补帧
+tools/android/dev/pocket_s.sh profile    # 可选：把 GPU 命令线程绑到超大核（bionic-local.sh）
+tools/android/dev/pocket_s.sh log        # 玩过之后拉回日志并输出汇总
+```
+
+不用 `migrate` 也可以：在 Bloodborne PS 里选同一个游戏文件夹，然后在手机上重新编一次原生代码（6～12 分钟）。
+
+## 用法二：直接替换官方 App 里的库（不重装 App，游戏和已编好的原生代码都不受影响）
 
 前提：Pocket S 上已经装了官方 2.2.0 App，并且至少启动过一次；电脑能用 adb 连上设备。官方 APK 是 debuggable 的，
-所以可以用 `run-as` 直接替换 App 目录里的库。
+所以可以用 `run-as` 直接替换 App 目录里的库。所有命令前面加上 `BB_PKG=com.ducvd89.bloodborne`：
 
 ```bash
 tools/android/dev/build_libbbgpu.sh      # 编 libbbgpu.so（需要 NDK 29 和依赖库，见脚本开头）
+export BB_PKG=com.ducvd89.bloodborne
 tools/android/dev/pocket_s.sh push       # 推送到设备（第一次会把官方的库备份成 libbbgpu.so.official）
 tools/android/dev/pocket_s.sh settings   # 设置 fps_limit=30、vsync=1、关闭补帧（会先备份 bbport.ini）
 # 在 Pocket S 上玩 15～30 分钟
