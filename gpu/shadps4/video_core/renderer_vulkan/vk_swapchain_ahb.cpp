@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "bb_lsfg_state.h"
+#include "bbport_pacing.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "imgui/renderer/imgui_core.h"
@@ -318,6 +319,8 @@ void Swapchain::HandleRelease(BbPresent::Release& release) {
     if (buffer.release_fd >= 0) {
         close(buffer.release_fd);
     }
+    // bbport: when the frame left the screen (bbport_pacing.h); the fence stays the buffer's.
+    BbPacing::FrameReleased(release.frame, release.fence_fd, client.Fifo());
     buffer.release_fd = release.fence_fd;
     free_queue.push_back(release.index);
 }
@@ -421,6 +424,7 @@ bool Swapchain::Present() {
         if (!client.SendFrame(generation, image_index, frame_counter, width, height, fence_fd)) {
             PeerGone();
         }
+        BbPacing::FrameSent(frame_counter);
         // The buffer is the app's until its release.
     } else {
         // Nobody shows it: the sync file is dropped, the buffer is free at once.

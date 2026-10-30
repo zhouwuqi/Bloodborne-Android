@@ -17,6 +17,7 @@
 #include "common/assert.h"
 #include "bbport_tex_home.h"
 #include "bbport_adpf.h"
+#include "bbport_pacing.h"
 #include "bbport_toggles.h"
 #include "bbport_guest_memory.h"
 #include "bbport_uma.h"
@@ -1208,10 +1209,26 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     const auto frame_period = frame_limit ? std::chrono::nanoseconds(1000000000 / frame_limit)
                                           : std::chrono::nanoseconds(0);
     auto next_flip = std::chrono::steady_clock::now();
+    // bbport: a flip only a little after its slot (this thread waking up from sleep_until, well
+    // under a millisecond) keeps the slots' rhythm. Counted from the moment it ran instead, every
+    // frame got that much longer: 29.9 FPS at a limit of 30, a refresh slipping against the display
+    // every few seconds (BB_PACE_FROM_WAKE=1 restores that). A later flip still moves the slots.
+    static const bool from_wake = [] {
+        const char* env = std::getenv("BB_PACE_FROM_WAKE");
+        return env && env[0] == '1';
+    }();
+    const auto wake_slack = std::min<std::chrono::nanoseconds>(std::chrono::milliseconds(1),
+                                                               frame_period / 10);
     const auto next_slot = [&](std::chrono::steady_clock::time_point slot,
                                std::chrono::steady_clock::time_point at) {
-        return catch_up ? std::max(slot + frame_period, at - frame_period)
-                        : std::max(slot, at) + frame_period;
+        const auto from = !from_wake && at <= slot + wake_slack ? slot : std::max(slot, at);
+        const auto plain = catch_up ? std::max(slot + frame_period, at - frame_period)
+                                    : from + frame_period;
+        // bbport: the display's phase lock (bbport_pacing.h) keeps the slots where the frames
+        // reach the screen evenly.
+        return std::chrono::steady_clock::time_point(std::chrono::nanoseconds(BbPacing::AdjustSlot(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(plain.time_since_epoch()).count(),
+            frame_period.count())));
     };
     std::printf("VideoOut: vblank %u Hz, frame limit %u FPS\n",
                 EmulatorSettings.GetVblankFrequency(), frame_limit);

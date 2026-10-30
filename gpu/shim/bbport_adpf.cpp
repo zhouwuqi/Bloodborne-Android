@@ -8,12 +8,18 @@
 // clock. The longer of the two is reported: they work in parallel. The recorder threads spin while
 // they wait for work, so their CPU time says nothing about the frame and is not measured (they are
 // in the session, which is what the hint's boost applies to).
+//
+// The target is a share of the frame budget (BB_ADPF_MARGIN, 0.85 by default: the CPU keeps a margin
+// for the heavier frames) until the thermal governor below lets it go up to the whole budget.
 #include "bbport_adpf.h"
+#include "bbport_pacing.h"
 #include "core/emulator_settings.h"
 
+#include <dirent.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -26,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -81,6 +88,8 @@ struct State {
     int recorders = 0;
     bool have_main = false, have_gpu = false, have_draw = false, have_render = false;
     i64 target_ns = 0;
+    double margin = 0.85;         ///< BB_ADPF_MARGIN: the target's share of the frame budget
+    std::atomic<int> level{0};    ///< the thermal governor's level (1 and up: the whole budget)
     u64 last_frame_ns = 0;
     int attempts = 0;
     u64 next_attempt_ns = 0;
@@ -105,6 +114,9 @@ void LoadApi() {
     s.enabled = !EnvOff("BB_ADPF");
     if (!s.enabled) {
         return;
+    }
+    if (const char* v = std::getenv("BB_ADPF_MARGIN"); v && *v) {
+        s.margin = std::clamp(std::strtod(v, nullptr), 0.5, 1.0);
     }
     void* lib = dlopen("libandroid.so", RTLD_NOW);
     if (!lib) {
@@ -144,8 +156,10 @@ bool HintsAvailable(const Api& a) {
 }
 
 i64 TargetNs() {
+    const State& s = S();
     const unsigned limit = EmulatorSettings.GetFrameLimit();
-    return 1000000000ll / (limit ? limit : 60);
+    const i64 budget = 1000000000ll / (limit ? limit : 60);
+    return s.level.load(std::memory_order_relaxed) >= 1 ? budget : i64(double(budget) * s.margin);
 }
 
 void OpenProbe(Probe& p, int tid) {
@@ -274,6 +288,185 @@ const char* ThermalName(int status) {
     return status >= 0 && status < 7 ? names[status] : "unknown";
 }
 
+// ---- Thermal governor (BB_THERMAL_GOV=0: off) ----
+// Level 0: the hint's target keeps its margin (above). Level 1, from a headroom forecast (10 s) of
+// 0.85: the whole frame budget, the clocks only as fast as the frame needs. Level 2, from 0.95 (1.0 is
+// where the device starts to throttle): the game's threads also leave the prime core(s), a Cortex-X3
+// class core at its top clock draws several times the power of a big core. A level is left after 30 s
+// at least 0.10 below the headroom that started it. Without a headroom figure the status counts
+// (light: level 1, moderate and up: level 2).
+constexpr float kLevelFrom[3] = {0.0f, 0.85f, 0.95f};
+
+struct Governor {
+    bool on = false;
+    int level = 0;
+    u64 below_since = 0;
+    bool can_park = false;
+    cpu_set_t base;   ///< the process's CPUs at the start
+    cpu_set_t parked; ///< base without the prime cores
+};
+
+bool ReadLong(const char* path, long& value) {
+    FILE* f = std::fopen(path, "re");
+    if (!f) {
+        return false;
+    }
+    const bool ok = std::fscanf(f, "%ld", &value) == 1;
+    std::fclose(f);
+    return ok;
+}
+
+/// The prime cores of `set`: the fastest (cpu_capacity, else cpuinfo_max_freq) when there are at most
+/// two of them and they are at least 10% faster than the next ones.
+bool PrimeCpus(const cpu_set_t& set, cpu_set_t& prime) {
+    long speed[64] = {};
+    long top = 0;
+    for (int cpu = 0; cpu < 64; ++cpu) {
+        if (!CPU_ISSET(cpu, &set)) {
+            continue;
+        }
+        char path[96];
+        std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu);
+        if (!ReadLong(path, speed[cpu])) {
+            std::snprintf(path, sizeof(path),
+                          "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+            ReadLong(path, speed[cpu]);
+        }
+        top = std::max(top, speed[cpu]);
+    }
+    long next = 0;
+    int count = 0;
+    CPU_ZERO(&prime);
+    for (int cpu = 0; cpu < 64; ++cpu) {
+        if (!CPU_ISSET(cpu, &set) || speed[cpu] <= 0) {
+            continue;
+        }
+        if (speed[cpu] == top) {
+            ++count;
+            CPU_SET(cpu, &prime);
+        } else {
+            next = std::max(next, speed[cpu]);
+        }
+    }
+    return top > 0 && next > 0 && count <= 2 && top * 10 >= next * 11;
+}
+
+/// Every thread of the process runs on `set`; the GPU command processor keeps its own pin when it
+/// has one (BB_GPUCOMM_CPUS). `changed_only`: leaves threads that already have it. Returns the
+/// threads changed.
+int ApplyCpus(const cpu_set_t& set, bool changed_only) {
+    const char* pin = std::getenv("BB_GPUCOMM_CPUS");
+    const bool keep_gpucomm = pin && *pin;
+    DIR* dir = opendir("/proc/self/task");
+    if (!dir) {
+        return 0;
+    }
+    int changed = 0;
+    while (const dirent* entry = readdir(dir)) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') {
+            continue;
+        }
+        const pid_t tid = pid_t(std::atoi(entry->d_name));
+        if (keep_gpucomm) {
+            char path[64], name[32] = {};
+            std::snprintf(path, sizeof(path), "/proc/self/task/%d/comm", int(tid));
+            const int fd = open(path, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                const ssize_t n = read(fd, name, sizeof(name) - 1);
+                close(fd);
+                if (n > 0 && !std::strncmp(name, "shadPS4:GpuComm", 15)) {
+                    continue;
+                }
+            }
+        }
+        cpu_set_t current;
+        if (changed_only && sched_getaffinity(tid, sizeof(current), &current) == 0 &&
+            CPU_EQUAL(&current, &set)) {
+            continue;
+        }
+        if (sched_setaffinity(tid, sizeof(set), &set) == 0) {
+            ++changed;
+        }
+    }
+    closedir(dir);
+    return changed;
+}
+
+void StartGovernor(Governor& g) {
+    g.on = !EnvOff("BB_THERMAL_GOV");
+    if (!g.on) {
+        std::printf("Thermal governor: off (BB_THERMAL_GOV=0)\n");
+        return;
+    }
+    CPU_ZERO(&g.base);
+    CPU_ZERO(&g.parked);
+    cpu_set_t prime;
+    if (sched_getaffinity(0, sizeof(g.base), &g.base) == 0 && PrimeCpus(g.base, prime)) {
+        CPU_XOR(&g.parked, &g.base, &prime);
+        g.can_park = CPU_COUNT(&g.parked) > 0;
+    }
+    std::string cores;
+    for (int cpu = 0; cpu < 64 && g.can_park; ++cpu) {
+        if (CPU_ISSET(cpu, &g.base) && !CPU_ISSET(cpu, &g.parked)) {
+            cores += (cores.empty() ? "" : ",") + std::to_string(cpu);
+        }
+    }
+    std::printf("Thermal governor: on; ADPF target %.0f%% of the frame budget, the whole budget from "
+                "a headroom forecast of %.2f, %s from %.2f\n",
+                S().margin * 100.0, double(kLevelFrom[1]),
+                g.can_park ? ("prime core(s) " + cores + " left").c_str() : "no prime core to leave",
+                double(kLevelFrom[2]));
+}
+
+void SetLevel(Governor& g, int level, float headroom) {
+    const int old = g.level;
+    g.level = level;
+    S().level.store(level, std::memory_order_relaxed); // the next frame passes the target on
+    int moved = 0;
+    if (g.can_park && level >= 2 && old < 2) {
+        moved = ApplyCpus(g.parked, false);
+    } else if (g.can_park && level < 2 && old >= 2) {
+        moved = ApplyCpus(g.base, false);
+    }
+    std::printf("Thermal governor: level %d (headroom %.2f): ADPF target %.1f ms%s", level,
+                double(headroom), double(TargetNs()) / 1e6,
+                !g.can_park ? "" : level >= 2 ? ", prime core(s) left" : ", all cores");
+    if (moved) {
+        std::printf(" (%d threads moved)", moved);
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+}
+
+void StepGovernor(Governor& g, int status, float headroom) {
+    float h = headroom;
+    if (!std::isfinite(h)) {
+        h = status >= 2 ? kLevelFrom[2] : status == 1 ? kLevelFrom[1] : 0.0f;
+    }
+    int want = g.level;
+    if (h >= kLevelFrom[2]) {
+        want = 2;
+    } else if (h >= kLevelFrom[1]) {
+        want = std::max(want, 1);
+    }
+    if (want > g.level) {
+        g.below_since = 0;
+        SetLevel(g, want, h);
+        return;
+    }
+    if (g.level == 0 || h >= kLevelFrom[g.level] - 0.10f) {
+        g.below_since = 0;
+        return;
+    }
+    const u64 now = NowNs();
+    if (!g.below_since) {
+        g.below_since = now;
+    } else if (now - g.below_since >= 30000000000ull) {
+        g.below_since = 0;
+        SetLevel(g, g.level - 1, h);
+    }
+}
+
 void ThermalLoop() {
     State& s = S();
     pthread_setname_np(pthread_self(), "bb:Thermal");
@@ -282,14 +475,16 @@ void ThermalLoop() {
         std::printf("Thermal: off (AThermal_acquireManager returned null)\n");
         return;
     }
+    Governor g;
+    StartGovernor(g);
     int last = -2;
     while (true) {
         const int status = s.api.thermal_status(manager);
+        // The headroom (API 31), forecast 10 s ahead: 1.0 is where the device starts to throttle;
+        // NaN: unknown (and at most one call a second gives a fresh value).
+        const float headroom = s.api.thermal_headroom ? s.api.thermal_headroom(manager, 10) : NAN;
         if (status != last) {
             last = status;
-            // The headroom (API 31): 1.0 is where the device starts to throttle; NaN: unknown.
-            const float headroom = s.api.thermal_headroom ? s.api.thermal_headroom(manager, 0)
-                                                          : NAN;
             if (std::isfinite(headroom)) {
                 std::printf("Thermal: status %s (%d), headroom %.2f\n", ThermalName(status), status,
                             double(headroom));
@@ -299,7 +494,20 @@ void ThermalLoop() {
             }
             std::fflush(stdout);
         }
-        std::this_thread::sleep_for(std::chrono::seconds(5));
+        if (g.on) {
+            StepGovernor(g, status, headroom);
+        }
+        BbPacing::NoteThermal(status, headroom, g.level);
+        if (g.level >= 2 && g.can_park) {
+            // Android gives the threads the cpuset's CPUs again when it moves the app between
+            // cpusets: look again ten times a second while the prime cores are left.
+            for (int i = 0; i < 20; ++i) {
+                ApplyCpus(g.parked, true);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
     }
 }
 
